@@ -86,12 +86,31 @@ fn request_accessibility_if_needed() {
     }
 }
 
+/// Cached microphone permission status. Once "authorized" (3) or "denied" (1),
+/// the value won't change without an app restart, so we avoid re-spawning `swift`
+/// on every Settings focus event.
+#[cfg(target_os = "macos")]
+static MIC_PERMISSION_CACHE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 /// macOS: Check microphone authorization status via swift subprocess.
 /// The AVFoundation Objective-C FFI from Rust has symbol resolution issues with
 /// AVMediaTypeAudio, so we shell out to swift which handles it natively.
 /// Returns: 0 = not determined, 1 = denied, 2 = restricted, 3 = authorized
+///
+/// Results are cached once a terminal state (authorized/denied) is reached.
+/// Pass `force = true` to bypass the cache (e.g. after requesting permission).
 #[cfg(target_os = "macos")]
-pub fn check_microphone_permission() -> i32 {
+pub fn check_microphone_permission_inner(force: bool) -> i32 {
+    use std::sync::atomic::Ordering;
+
+    if !force {
+        let cached = MIC_PERMISSION_CACHE.load(Ordering::Relaxed);
+        // Return cache if we have a terminal state (authorized=3 or denied=1)
+        if cached == 1 || cached == 3 {
+            return cached;
+        }
+    }
+
     let output = std::process::Command::new("swift")
         .args([
             "-e",
@@ -99,21 +118,12 @@ pub fn check_microphone_permission() -> i32 {
         ])
         .output();
 
-    match output {
+    let status = match output {
         Ok(out) if out.status.success() => {
-            let status = String::from_utf8_lossy(&out.stdout)
+            String::from_utf8_lossy(&out.stdout)
                 .trim()
                 .parse::<i32>()
-                .unwrap_or(-1);
-            let label = match status {
-                0 => "not_determined",
-                1 => "denied",
-                2 => "restricted",
-                3 => "authorized",
-                _ => "unknown",
-            };
-            log::info!("[permissions] Microphone: status = {} ({})", status, label);
-            status
+                .unwrap_or(-1)
         }
         Ok(out) => {
             log::warn!(
@@ -126,7 +136,25 @@ pub fn check_microphone_permission() -> i32 {
             log::warn!("[permissions] failed to run swift: {}", e);
             -1
         }
-    }
+    };
+
+    let label = match status {
+        0 => "not_determined",
+        1 => "denied",
+        2 => "restricted",
+        3 => "authorized",
+        _ => "unknown",
+    };
+    log::info!("[permissions] Microphone: status = {} ({})", status, label);
+
+    MIC_PERMISSION_CACHE.store(status, Ordering::Relaxed);
+    status
+}
+
+/// Convenience wrapper that uses the cache by default.
+#[cfg(target_os = "macos")]
+pub fn check_microphone_permission() -> i32 {
+    check_microphone_permission_inner(false)
 }
 
 /// macOS: Request microphone permission via swift subprocess.
@@ -154,6 +182,8 @@ fn request_microphone_permission() {
             Ok(out) => {
                 let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 log::info!("[permissions] Microphone request result: {}", result);
+                // Invalidate cache so the next check picks up the new state
+                MIC_PERMISSION_CACHE.store(-1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
                 log::warn!("[permissions] Failed to request mic permission: {}", e);
@@ -298,16 +328,6 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             {
-                // Log bundle ID for debugging permission identity
-                if let Ok(output) = std::process::Command::new("defaults")
-                    .args(["read", "/proc/curproc/../Info", "CFBundleIdentifier"])
-                    .output()
-                {
-                    log::info!(
-                        "[permissions] Bundle ID from defaults: {}",
-                        String::from_utf8_lossy(&output.stdout).trim()
-                    );
-                }
                 log::info!(
                     "[permissions] PID = {}, executable = {:?}",
                     std::process::id(),

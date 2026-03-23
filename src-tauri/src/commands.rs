@@ -348,9 +348,9 @@ pub async fn request_microphone() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         crate::request_microphone_permission();
-        // Give the system a moment to show the dialog, then re-check
+        // Give the system a moment to show the dialog, then force a fresh check
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let status = crate::check_microphone_permission();
+        let status = crate::check_microphone_permission_inner(true);
         let label = match status {
             0 => "not_determined",
             1 => "denied",
